@@ -1,0 +1,133 @@
+name: deploy
+
+# Builds the site, proves the job's identity with its GitHub OIDC token, exchanges it for a short-lived
+# access token, and records the deployment in an internal console. No long-lived deploy credential is stored
+# for the job's identity. All endpoints are repository secrets so they are masked in logs.
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment label shown in the console"
+        required: false
+        default: staging
+
+permissions:
+  id-token: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AUTH_URL: ${{ secrets.DEPLOY_AUTH_URL }}
+      APP_URL: ${{ secrets.DEPLOY_APP_URL }}
+      OIDC_AUDIENCE: ${{ secrets.DEPLOY_OIDC_AUDIENCE }}
+      TARGET_AUDIENCE: ${{ secrets.DEPLOY_TARGET_AUDIENCE }}
+      TOKEN_PATH: /_access/oauth/token
+      EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+      EDGE_CLIENT_SECRET: ${{ secrets.EDGE_CLIENT_SECRET }}
+      DEPLOY_ENV: ${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          mkdir -p dist
+          sed -e "s/__VERSION__/$version/g" -e "s/__SHA__/${GITHUB_SHA::7}/g" site/index.html > dist/index.html
+          sleep 5
+          echo "built version $version at ${GITHUB_SHA::7}"
+
+      - name: Check configuration
+        id: cfg
+        run: |
+          missing=()
+          for v in AUTH_URL APP_URL OIDC_AUDIENCE TARGET_AUDIENCE EDGE_CLIENT_ID EDGE_CLIENT_SECRET; do
+            [ -n "${!v}" ] || missing+=("$v")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::notice::Deploy skipped: missing secrets (${missing[*]}). See README."
+            echo "## Deploy skipped: missing secrets" >> "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get the GitHub OIDC token
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          resp=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$(jq -rn --arg a "$OIDC_AUDIENCE" '$a|@uri')")
+          token=$(jq -r '.value' <<<"$resp")
+          echo "::add-mask::$token"
+          umask 077
+          printf '%s' "$token" > "$RUNNER_TEMP/oidc.jwt"
+          echo "got an OIDC token for ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}"
+
+      - name: Exchange it for an access token
+        id: exchange
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/exchange.json"
+          status=000
+          for attempt in 1 2 3; do
+            status=$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -X POST "${AUTH_URL%/}$TOKEN_PATH" \
+              -H "CF-Access-Client-Id: $EDGE_CLIENT_ID" -H "CF-Access-Client-Secret: $EDGE_CLIENT_SECRET" \
+              --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+              --data-urlencode "subject_token=$(cat "$RUNNER_TEMP/oidc.jwt")" \
+              --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+              --data-urlencode "audience=$TARGET_AUDIENCE" || echo 000)
+            case "$status" in 000|5??) echo "attempt $attempt: HTTP $status, retrying"; sleep 3 ;; *) break ;; esac
+          done
+          if [ "$status" != 200 ] || ! jq -e '.access_token' "$out" >/dev/null 2>&1; then
+            error=$(jq -r '.error // empty' "$out" 2>/dev/null || true)
+            echo "::error title=Token exchange refused::HTTP $status ${error:-}"
+            echo "## ❌ Token exchange refused (HTTP $status ${error:-})" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          access=$(jq -r '.access_token' "$out")
+          echo "::add-mask::$access"
+          umask 077
+          printf '%s' "$access" > "$RUNNER_TEMP/access.jwt"
+          echo "access token issued (expires in $(jq -r '.expires_in' "$out")s)"
+
+      - name: Record the deployment
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/deploy.json"
+          payload=$(jq -nc \
+            --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF" --arg sha "$GITHUB_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg environment "$DEPLOY_ENV" \
+            '{repo: $repo, ref: $ref, sha: $sha, run_id: $run_id, run_url: $run_url, environment: $environment}')
+          status=000
+          # A newly created identity takes a few seconds to propagate; retry briefly.
+          for attempt in 1 2 3 4 5 6 7 8; do
+            status=$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -X POST "${APP_URL%/}/api/deployments" \
+              -H "CF-Access-Client-Id: $EDGE_CLIENT_ID" -H "CF-Access-Client-Secret: $EDGE_CLIENT_SECRET" \
+              -H "Authorization: Bearer $(cat "$RUNNER_TEMP/access.jwt")" \
+              -H 'Content-Type: application/json' -d "$payload" || echo 000)
+            case "$status" in
+              000|502|503|504|530) echo "attempt $attempt: HTTP $status, retrying"; sleep 3 ;;
+              403) if grep -q 'does not exist' "$out"; then echo "attempt $attempt: identity not propagated yet, retrying"; sleep 2; else break; fi ;;
+              *) break ;;
+            esac
+          done
+          if [ "$status" = 201 ]; then
+            echo "deployment recorded"
+            echo "## ✅ Deployed ${GITHUB_REF_NAME}@${GITHUB_SHA::7} ($DEPLOY_ENV)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error title=Deployment refused::HTTP $status"
+          echo "## ❌ Deployment refused (HTTP $status)" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
