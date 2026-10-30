@@ -34,7 +34,7 @@ jobs:
       EDGE_CLIENT_SECRET: ${{ secrets.EDGE_CLIENT_SECRET }}
       DEPLOY_ENV: ${{ inputs.environment || 'staging' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build
         run: |
