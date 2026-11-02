@@ -90,8 +90,9 @@ jobs:
           done
           if [ "$status" != 200 ] || ! jq -e '.access_token' "$out" >/dev/null 2>&1; then
             error=$(jq -r '.error // empty' "$out" 2>/dev/null || true)
-            echo "::error title=Token exchange refused::HTTP $status ${error:-}"
-            echo "## ❌ Token exchange refused (HTTP $status ${error:-})" >> "$GITHUB_STEP_SUMMARY"
+            desc=$(jq -r '.error_description // empty' "$out" 2>/dev/null || true)
+            echo "::error title=Token exchange refused::${error:-HTTP $status}${desc:+: $desc} (HTTP $status)"
+            echo "## ❌ Token exchange refused: ${error:-HTTP $status}${desc:+ — $desc} (HTTP $status)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           access=$(jq -r '.access_token' "$out")
