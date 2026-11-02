@@ -9,9 +9,8 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "Environment label shown in the console"
+        description: "Environment label shown in the console (default: the branch name)"
         required: false
-        default: staging
 
 permissions:
   id-token: write
@@ -32,7 +31,7 @@ jobs:
       TOKEN_PATH: /_access/oauth/token
       EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
       EDGE_CLIENT_SECRET: ${{ secrets.EDGE_CLIENT_SECRET }}
-      DEPLOY_ENV: ${{ inputs.environment || 'staging' }}
+      DEPLOY_ENV: ${{ inputs.environment || github.ref_name }}
     steps:
       - uses: actions/checkout@v5
 
@@ -110,7 +109,8 @@ jobs:
             --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF" --arg sha "$GITHUB_SHA" \
             --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --arg environment "$DEPLOY_ENV" \
-            '{repo: $repo, ref: $ref, sha: $sha, run_id: $run_id, run_url: $run_url, environment: $environment}')
+            --arg message "$(git log -1 --format=%s)" --arg version "$(cat VERSION)" \
+            '{repo: $repo, ref: $ref, sha: $sha, run_id: $run_id, run_url: $run_url, environment: $environment, message: $message, version: $version}')
           status=000
           # A newly created identity takes a few seconds to propagate; retry briefly.
           for attempt in 1 2 3 4 5 6 7 8; do
