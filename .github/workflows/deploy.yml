@@ -29,6 +29,8 @@ jobs:
       OIDC_AUDIENCE: ${{ secrets.DEPLOY_OIDC_AUDIENCE }}
       TARGET_AUDIENCE: ${{ secrets.DEPLOY_TARGET_AUDIENCE }}
       TOKEN_PATH: /_access/oauth/token
+      EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+      EDGE_CLIENT_SECRET: ${{ secrets.EDGE_CLIENT_SECRET }}
       DEPLOY_ENV: ${{ inputs.environment || github.ref_name }}
     steps:
       - uses: actions/checkout@v5
@@ -44,9 +46,6 @@ jobs:
 
       - name: Check configuration
         id: cfg
-        env:
-          EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
-          EDGE_CLIENT_SECRET: ${{ secrets.EDGE_CLIENT_SECRET }}
         run: |
           missing=()
           for v in AUTH_URL APP_URL OIDC_AUDIENCE TARGET_AUDIENCE EDGE_CLIENT_ID EDGE_CLIENT_SECRET; do
@@ -60,32 +59,18 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Demo plumbing (tunnel access, JWT printing)
+      - name: Define jwt_payload
         if: steps.cfg.outputs.enabled == 'true'
-        env:
-          EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
-          EDGE_CLIENT_SECRET: ${{ secrets.EDGE_CLIENT_SECRET }}
         run: |
-          # Not part of the flow. The demo stack sits behind a Cloudflare Tunnel protected by its own (outer) Access app:
-          # requests to the demo hosts carry that app's service token, added here so the steps below show only the flow.
-          umask 077
-          printf 'header = "CF-Access-Client-Id: %s"\nheader = "CF-Access-Client-Secret: %s"\n' \
-            "$EDGE_CLIENT_ID" "$EDGE_CLIENT_SECRET" > "$RUNNER_TEMP/tunnel.curlrc"
-          cat > "$RUNNER_TEMP/helpers.sh" <<'EOF'
-          curl() { # adds the tunnel headers to requests to the demo hosts only
-            local a
-            for a in "$@"; do
-              case "$a" in "${AUTH_URL%/}"*|"${APP_URL%/}"*) command curl -K "$RUNNER_TEMP/tunnel.curlrc" "$@"; return ;; esac
-            done
-            command curl "$@"
-          }
-          jwt_payload() { # prints a JWT's payload (the middle part, base64url) as JSON
+          # a helper for the next steps: prints a JWT's payload (the middle part, base64url) as JSON
+          cat > "$RUNNER_TEMP/jwt.sh" <<'EOF'
+          jwt_payload() {
             local p; p=$(cut -d. -f2 <<<"$1" | tr '_-' '/+')
             while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
             base64 -d <<<"$p" | jq .
           }
           EOF
-          echo "BASH_ENV=$RUNNER_TEMP/helpers.sh" >> "$GITHUB_ENV"
+          echo "BASH_ENV=$RUNNER_TEMP/jwt.sh" >> "$GITHUB_ENV"
 
       - name: Get the GitHub OIDC token
         if: steps.cfg.outputs.enabled == 'true'
@@ -111,6 +96,7 @@ jobs:
           status=000
           for attempt in 1 2 3; do
             status=$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -X POST "${AUTH_URL%/}$TOKEN_PATH" \
+              -H "CF-Access-Client-Id: $EDGE_CLIENT_ID" -H "CF-Access-Client-Secret: $EDGE_CLIENT_SECRET" \
               --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
               --data-urlencode "subject_token=$(cat "$RUNNER_TEMP/oidc.jwt")" \
               --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
@@ -148,6 +134,7 @@ jobs:
           # A newly created identity takes a few seconds to propagate; retry briefly.
           for attempt in 1 2 3 4 5 6 7 8; do
             status=$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -X POST "${APP_URL%/}/api/deployments" \
+              -H "CF-Access-Client-Id: $EDGE_CLIENT_ID" -H "CF-Access-Client-Secret: $EDGE_CLIENT_SECRET" \
               -H "Authorization: Bearer $(cat "$RUNNER_TEMP/access.jwt")" \
               -H 'Content-Type: application/json' -d "$payload" || echo 000)
             case "$status" in
