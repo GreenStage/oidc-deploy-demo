@@ -26,8 +26,8 @@ jobs:
     env:
       AUTH_URL: ${{ secrets.DEPLOY_AUTH_URL }}
       APP_URL: ${{ secrets.DEPLOY_APP_URL }}
-      OIDC_AUDIENCE: ${{ secrets.DEPLOY_OIDC_AUDIENCE }}
-      TARGET_AUDIENCE: ${{ secrets.DEPLOY_TARGET_AUDIENCE }}
+      OIDC_AUDIENCE: ${{ vars.DEPLOY_OIDC_AUDIENCE }}
+      TARGET_AUDIENCE: ${{ vars.DEPLOY_TARGET_AUDIENCE }}
       TOKEN_PATH: /_access/oauth/token
       EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
       EDGE_CLIENT_SECRET: ${{ secrets.EDGE_CLIENT_SECRET }}
@@ -52,8 +52,8 @@ jobs:
             [ -n "${!v}" ] || missing+=("$v")
           done
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::notice::Deploy skipped: missing secrets (${missing[*]}). See README."
-            echo "## Deploy skipped: missing secrets" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::Deploy skipped: missing secrets or variables (${missing[*]}). See README."
+            echo "## Deploy skipped: missing secrets or variables" >> "$GITHUB_STEP_SUMMARY"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -79,7 +79,7 @@ jobs:
           set -euo pipefail
           cat <<EOF
           \$ curl -H "Authorization: bearer \$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \\
-              "\$ACTIONS_ID_TOKEN_REQUEST_URL&audience=<the audience Access expects for GitHub>"
+              "\$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OIDC_AUDIENCE"
           EOF
           resp=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$(jq -rn --arg a "$OIDC_AUDIENCE" '$a|@uri')")
@@ -105,7 +105,7 @@ jobs:
               -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \\
               -d subject_token=$(short "$(cat "$RUNNER_TEMP/oidc.jwt")") \\
               -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \\
-              -d audience=<the Deploy Console app>
+              -d audience=$TARGET_AUDIENCE
           EOF
           status=000
           for attempt in 1 2 3; do
