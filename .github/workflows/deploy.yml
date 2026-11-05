@@ -59,11 +59,12 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Define jwt_payload
+      - name: Define helpers
         if: steps.cfg.outputs.enabled == 'true'
         run: |
-          # a helper for the next steps: prints a JWT's payload (the middle part, base64url) as JSON
+          # helpers for the next steps: shorten a token for display, print a JWT's payload (the middle part, base64url) as JSON
           cat > "$RUNNER_TEMP/jwt.sh" <<'EOF'
+          short() { printf '%s…(%d chars)' "${1:0:20}" "${#1}"; }
           jwt_payload() {
             local p; p=$(cut -d. -f2 <<<"$1" | tr '_-' '/+')
             while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
@@ -76,9 +77,15 @@ jobs:
         if: steps.cfg.outputs.enabled == 'true'
         run: |
           set -euo pipefail
+          cat <<EOF
+          \$ curl -H "Authorization: bearer \$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \\
+              "\$ACTIONS_ID_TOKEN_REQUEST_URL&audience=<the audience Access expects for GitHub>"
+          EOF
           resp=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$(jq -rn --arg a "$OIDC_AUDIENCE" '$a|@uri')")
           token=$(jq -r '.value' <<<"$resp")
+          echo "{\"value\": \"$(short "$token")\"}"
+          echo
           echo "::add-mask::$token"
           umask 077
           printf '%s' "$token" > "$RUNNER_TEMP/oidc.jwt"
@@ -93,6 +100,13 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/exchange.json"
+          cat <<EOF
+          \$ curl -X POST https://<Access team domain>$TOKEN_PATH \\
+              -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \\
+              -d subject_token=$(short "$(cat "$RUNNER_TEMP/oidc.jwt")") \\
+              -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \\
+              -d audience=<the Deploy Console app>
+          EOF
           status=000
           for attempt in 1 2 3; do
             status=$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 -X POST "${AUTH_URL%/}$TOKEN_PATH" \
@@ -103,6 +117,9 @@ jobs:
               --data-urlencode "audience=$TARGET_AUDIENCE" || echo 000)
             case "$status" in 000|5??) echo "attempt $attempt: HTTP $status, retrying"; sleep 3 ;; *) break ;; esac
           done
+          echo "HTTP $status"
+          jq 'if .access_token then .access_token = (.access_token[0:20] + "…") else . end' "$out" 2>/dev/null || cat "$out"
+          echo
           if [ "$status" != 200 ] || ! jq -e '.access_token' "$out" >/dev/null 2>&1; then
             error=$(jq -r '.error // empty' "$out" 2>/dev/null || true)
             desc=$(jq -r '.error_description // empty' "$out" 2>/dev/null || true)
@@ -130,6 +147,12 @@ jobs:
             --arg environment "$DEPLOY_ENV" \
             --arg message "$(git log -1 --format=%s)" --arg version "$(cat VERSION)" \
             '{repo: $repo, ref: $ref, sha: $sha, run_id: $run_id, run_url: $run_url, environment: $environment, message: $message, version: $version}')
+          cat <<EOF
+          \$ curl -X POST https://<Deploy Console>/api/deployments \\
+              -H "Authorization: Bearer $(short "$(cat "$RUNNER_TEMP/access.jwt")")" \\
+              -H 'Content-Type: application/json' \\
+              -d '$(jq . <<<"$payload")'
+          EOF
           status=000
           # A newly created identity takes a few seconds to propagate; retry briefly.
           for attempt in 1 2 3 4 5 6 7 8; do
@@ -143,6 +166,9 @@ jobs:
               *) break ;;
             esac
           done
+          echo "HTTP $status"
+          jq . "$out" 2>/dev/null || cat "$out"
+          echo
           if [ "$status" = 201 ]; then
             echo "deployment recorded"
             echo "## ✅ Deployed ${GITHUB_REF_NAME}@${GITHUB_SHA::7} ($DEPLOY_ENV)" >> "$GITHUB_STEP_SUMMARY"
