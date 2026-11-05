@@ -59,6 +59,19 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Define jwt_payload
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          # a helper for the next steps: prints a JWT's payload (the middle part, base64url) as JSON
+          cat > "$RUNNER_TEMP/jwt.sh" <<'EOF'
+          jwt_payload() {
+            local p; p=$(cut -d. -f2 <<<"$1" | tr '_-' '/+')
+            while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+            base64 -d <<<"$p" | jq .
+          }
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/jwt.sh" >> "$GITHUB_ENV"
+
       - name: Get the GitHub OIDC token
         if: steps.cfg.outputs.enabled == 'true'
         run: |
@@ -70,6 +83,9 @@ jobs:
           umask 077
           printf '%s' "$token" > "$RUNNER_TEMP/oidc.jwt"
           echo "got an OIDC token for ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}"
+          echo "::group::GitHub OIDC token payload (claims only; the signature is not printed, secret values show as ***)"
+          jwt_payload "$token"
+          echo "::endgroup::"
 
       - name: Exchange it for an access token
         id: exchange
@@ -99,6 +115,9 @@ jobs:
           umask 077
           printf '%s' "$access" > "$RUNNER_TEMP/access.jwt"
           echo "access token issued (expires in $(jq -r '.expires_in' "$out")s)"
+          echo "::group::Access token payload (claims only; the signature is not printed, secret values show as ***)"
+          jwt_payload "$access"
+          echo "::endgroup::"
 
       - name: Record the deployment
         if: steps.cfg.outputs.enabled == 'true'
